@@ -6,6 +6,14 @@ __pycache__/
 # 환경변수 (API 키 절대 올리지 말 것)
 .env
 
+# 데이터셋 (용량이 커서 git 제외)
+data/
+
+# 학습된 모델 가중치
+*.pth
+*.pt
+*.ckpt
+
 # Flutter
 build/
 .dart_tool/
