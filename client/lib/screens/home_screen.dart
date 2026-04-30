@@ -181,7 +181,7 @@ class _WeeklyChart extends StatelessWidget {
     final today = DateTime.now().weekday - 1;
 
     for (final r in records) {
-      if (r.warningLevel >= 1) counts[today]++;
+      if (r.warningLevel >= 1) counts[r.timestamp.weekday - 1]++;
     }
     final maxCount = counts.reduce((a, b) => a > b ? a : b).clamp(1, 999);
 

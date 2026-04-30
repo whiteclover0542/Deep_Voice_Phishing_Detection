@@ -18,9 +18,10 @@ class AudioService {
       ),
     );
 
-    _subscription = stream.listen((chunk) {
-      onAudioChunk(chunk);
-    });
+    _subscription = stream.listen(
+      (chunk) => onAudioChunk(chunk),
+      onError: (_) => stop(),
+    );
   }
 
   Future<void> stop() async {
