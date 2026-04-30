@@ -29,7 +29,8 @@ class SincConv(nn.Module):
 
     def forward(self, x):
         f1 = 30 + torch.abs(self.f_low)
-        f2 = torch.clamp(f1 + torch.abs(self.f_band), min=f1 + 50, max=self.sample_rate / 2)
+        f2 = torch.max(f1 + torch.abs(self.f_band), f1 + 50)
+        f2 = torch.clamp(f2, max=self.sample_rate / 2)
 
         def sinc(f):
             return torch.sin(2 * np.pi * f * self.n_ / self.sample_rate) / (np.pi * self.n_)

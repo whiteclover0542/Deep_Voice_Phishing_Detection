@@ -3,6 +3,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 import soundfile as sf
+import io
 
 FIXED_LEN = 64600  # 16kHz 기준 약 4초
 
@@ -14,7 +15,7 @@ class ASVspoof2019LA(Dataset):
         'eval':  'ASVspoof2019.LA.cm.eval.trl.txt',
     }
 
-    def __init__(self, data_root, split='train'):
+    def __init__(self, data_root, split='train', max_samples=None):  # max_samples 추가
         """
         data_root : LA 폴더 경로 (예: /content/drive/MyDrive/data/LA)
         split     : 'train' | 'dev' | 'eval'
@@ -30,18 +31,51 @@ class ASVspoof2019LA(Dataset):
             data_root, 'ASVspoof2019_LA_cm_protocols', self.PROTOCOLS[split]
         )
 
+        # 수정 코드 - 파일 존재 여부 확인 후 추가
         self.samples = []
+        missing = 0
         with open(proto_path, 'r') as f:
             for line in f:
                 parts = line.strip().split()
-                # 형식: SPEAKER_ID  FILE_ID  -  ATTACK_TYPE  LABEL
                 file_id = parts[1]
-                label = 0 if parts[-1] == 'genuine' else 1
-                self.samples.append((file_id, label))
+                label = 0 if parts[-1] == 'bonafide' else 1
+                path = os.path.join(self.audio_dir, f'{file_id}.flac')
+                if os.path.exists(path):
+                    self.samples.append((file_id, label))
+                else:
+                    missing += 1
+
+
+        if max_samples is not None:
+            # 1. 클래스별로 분리
+            genuine = [s for s in self.samples if s[1] == 0]
+            spoof   = [s for s in self.samples if s[1] == 1]
+            
+            # [추가] 2. 랜덤하게 섞기 (numpy 활용)
+            # 실험의 재현성을 위해 시드(seed)를 고정하는 것이 좋습니다.
+            np.random.seed(42) 
+            np.random.shuffle(genuine)
+            np.random.shuffle(spoof)
+            
+            # 3. 정해진 양만큼 자르기
+            half = max_samples // 2
+            self.samples = genuine[:half] + spoof[:half]
+            
+            # [추가] 4. 합쳐진 리스트를 한 번 더 섞기 
+            # (학습 시 첫 번째 배치에 정답만 몰려있는 것을 방지)
+            np.random.shuffle(self.samples)
+
+        print(f'[{split}] 로드: {len(self.samples)}개, 누락: {missing}개')  # ← 이 줄 추가
+
+        # ── 추가: 전체 데이터를 RAM에 캐싱 ──────────────────────────
+        #print(f'[{split}] RAM 캐싱 중...')
+        #self.cache = [self._load_wav(fid) for fid, _ in self.samples]
+        #print(f'[{split}] 캐싱 완료')
 
     def _load_wav(self, file_id):
         path = os.path.join(self.audio_dir, f'{file_id}.flac')
-        wav, _ = sf.read(path, dtype='float32')
+        with open(path, 'rb') as f:
+            wav, _ = sf.read(io.BytesIO(f.read()), dtype='float32')
 
         if len(wav) >= FIXED_LEN:
             wav = wav[:FIXED_LEN]
@@ -55,4 +89,5 @@ class ASVspoof2019LA(Dataset):
 
     def __getitem__(self, idx):
         file_id, label = self.samples[idx]
-        return self._load_wav(file_id), label
+        #return self.cache[idx], label   # 디스크 대신 RAM에서 읽기
+        return self._load_wav(file_id), label   # 디스크에서 읽기

@@ -1,0 +1,7 @@
+[2026-04-29]
+ASVspoof 영어 원본
+Max_Samples: 150, BATCH_SIZE: 16, EPOCHS: 5, [Eval] Loss 0.5937, Acc 0.7067 / EER 36.00%
+Max_Samples: 500, BATCH_SIZE: 16, EPOCHS: 5, [Eval] Loss 0.1858, Acc 0.9380 / EER 15.60%
+Max_Samples: 2500, BATCH_SIZE: 24, EPOCHS: 5, [Eval] Loss 0.0756, Acc 0.9708 / EER 6.24%
+Max_Samples: None, BATCH_SIZE: 64, EPOCHS: 20, [Eval] Loss 0.0011, Acc 0.9997 / EER 0.98%
+
