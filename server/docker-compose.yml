@@ -1,0 +1,13 @@
+services:
+  server:
+    container_name: Real_time_Voice_Phishing_Detection
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - .:/app
+    env_file:
+      - .env
+    environment:
+      - DEBUG=true
+    restart: unless-stopped
