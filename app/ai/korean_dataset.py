@@ -1,8 +1,18 @@
 # =====================================================================
-# KoreanDeepfakeDataset
+# KoreanDeepfakeDataset - 최종버전
 #
-# 데이터셋 109 (자유대화 음성 - 진짜, label=0)
-# 데이터셋 466 (감성 발화 TTS - 가짜, label=1)
+# 진짜 (label=0): 109번 자유대화 음성(일반남녀) - 스튜디오 녹음
+#   구조: real_root/[원천]3.스튜디오_1/화자폴더/*.wav
+#          real_root/[원천]3.스튜디오_2/화자폴더/*.wav
+#
+# 가짜 (label=1): 466번 감성 발화 스타일별 음성합성 TTS
+#   구조: fake_root/TS1/1.기쁨/*.wav
+#          fake_root/TS1/2.슬픔/*.wav  ...
+#          fake_root/TS2/...
+#
+# [finetune.py 경로 설정]
+# REAL_DATA_ROOT = r'...\자유대화 음성(일반남녀)\Training'
+# FAKE_DATA_ROOT = r'...\015.감성 및 발화 스타일별 음성합성 데이터\01.데이터\1.Training\원천데이터'
 # =====================================================================
 
 import os
@@ -12,100 +22,77 @@ import torch
 from torch.utils.data import Dataset
 import soundfile as sf
 
-
-# ── 실제 폴더 구조 ────────────────────────────────────────────────────
-#
-# [109번 - 진짜]
-# real_root/
-#   일반남여_통합01_F_HSH00_.../
-#     *.wav
-#
-# [466번 - 가짜 TTS]
-# fake_root/
-#   1.Training/원천데이터/
-#     TS1/TS1/1.감정/1.기쁨/0001_.../  *.wav
-#     TS2/TS2/1.감정/2.슬픔/...
-#   1.Validation/원천데이터/   (있을 경우)
-#     ...
-# ─────────────────────────────────────────────────────────────────────
-
-
-SR      = 16000       # 목표 샘플레이트
-MAX_LEN = SR * 4      # 4초 고정 (64,000 샘플)
+SR      = 16000
+MAX_LEN = SR * 4   # 4초
 SEED    = 42
 
 
 class KoreanDeepfakeDataset(Dataset):
-    """
-    split     : 'train' | 'dev'
-    noise_aug : True면 진짜 음성에 노이즈 증강 적용 (품질 차이 보정용)
-    real_limit: 진짜 음성 최대 샘플 수 (None이면 전부 사용)
-    """
-
     def __init__(
         self,
-        real_root,        # 109번 데이터 루트
-        fake_root,        # 466번 데이터 루트
+        real_root,        # 109번: Training 폴더 (스튜디오_1, _2 상위)
+        fake_root,        # 466번: 원천데이터 폴더 (TS1, TS2... 상위)
         split='train',
-        noise_aug=True,
-        real_limit=None,
+        noise_aug=True,   # 진짜 음성 노이즈 증강 (품질 차이 보정)
+        real_limit=None,  # 진짜 최대 샘플 수 (None=전부)
+        fake_limit=None,  # 가짜 최대 샘플 수 (None=전부)
     ):
         self.noise_aug = noise_aug
-        self.items = []   # (wav_path, label)
+        self.items = []
 
-        # ── 진짜 음성 (109번) ──────────────────────────────────────────
+        # ── 진짜 음성: 사용할 스튜디오 폴더 지정 ─────────────────────
+        # 압축 완료 후 리스트에 추가하면 됨
+        # 예: USE_STUDIOS = ['[원천]3.스튜디오_2', '[원천]3.스튜디오_1']
+        USE_STUDIOS = ['[원천]3.스튜디오_2']
+
         real_items = []
-        for dirpath, _, files in os.walk(real_root):
-            for fname in files:
-                if fname.endswith('.wav'):
-                    real_items.append((os.path.join(dirpath, fname), 0))
+        studio_dirs = [
+            d for d in USE_STUDIOS
+            if os.path.isdir(os.path.join(real_root, d))
+        ]
 
-        # train/dev 분할 (8:2)
-        random.seed(SEED)
+        if not studio_dirs:
+            print(f'  [경고] 스튜디오 폴더를 찾을 수 없음: {real_root}')
+        else:
+            print(f'  [진짜] 스튜디오 폴더: {studio_dirs}')
+            for studio_dir in studio_dirs:
+                studio_path = os.path.join(real_root, studio_dir)
+                for dirpath, _, files in os.walk(studio_path):
+                    for fname in files:
+                        if fname.lower().endswith('.wav'):
+                            real_items.append(
+                                (os.path.join(dirpath, fname), 0)
+                            )
+
+        # train/dev 분할 (8:2, 실행마다 랜덤)
         random.shuffle(real_items)
         cut = int(len(real_items) * 0.8)
         real_items = real_items[:cut] if split == 'train' else real_items[cut:]
 
-        # 최대 샘플 수 제한 (클래스 불균형 보정용)
         if real_limit is not None:
             real_items = real_items[:real_limit]
 
         self.items.extend(real_items)
 
-        # ── 가짜 음성 (466번 TTS) ──────────────────────────────────────
-        # 실제 폴더명: "1.Training" / "1.Validation"
-        # os.walk로 재귀 탐색하므로 TS1~TS4, 감정 하위폴더 깊이 무관
-        split_folder_candidates = {
-            'train': ['1.Training', 'Training'],
-            'dev':   ['1.Validation', 'Validation'],
-        }
 
-        fake_wav_root = None
-        for candidate in split_folder_candidates[split]:
-            path = os.path.join(fake_root, candidate, '원천데이터')
-            if os.path.isdir(path):
-                fake_wav_root = path
-                break
-
+        # ── 가짜 음성: TS1/1.기쁨/*.wav, TS2/... ─────────────────────
         fake_items = []
-        if fake_wav_root:
-            print(f'  [466번 탐색 경로] {fake_wav_root}')
-            for dirpath, _, files in os.walk(fake_wav_root):
-                for fname in files:
-                    if fname.endswith('.wav'):
-                        fake_items.append((os.path.join(dirpath, fname), 1))
-        else:
-            # 원천데이터 폴더를 못 찾으면 fake_root 전체 재귀 탐색
-            print(f'  [466번 경고] 원천데이터 폴더를 찾지 못해 {fake_root} 전체를 탐색합니다.')
-            for dirpath, _, files in os.walk(fake_root):
-                for fname in files:
-                    if fname.endswith('.wav'):
-                        fake_items.append((os.path.join(dirpath, fname), 1))
+        for dirpath, _, files in os.walk(fake_root):
+            for fname in files:
+                if fname.lower().endswith('.wav'):
+                    fake_items.append(
+                        (os.path.join(dirpath, fname), 1)
+                    )
 
-        random.seed(SEED)
+        if not fake_items:
+            print(f'  [경고] 가짜(TTS) wav를 찾을 수 없음: {fake_root}')
+
         random.shuffle(fake_items)
         cut = int(len(fake_items) * 0.8)
         fake_items = fake_items[:cut] if split == 'train' else fake_items[cut:]
+
+        if fake_limit is not None:
+            fake_items = fake_items[:fake_limit]
 
         self.items.extend(fake_items)
         random.shuffle(self.items)
@@ -121,41 +108,45 @@ class KoreanDeepfakeDataset(Dataset):
     def __getitem__(self, idx):
         wav_path, label = self.items[idx]
 
-        # ── wav 로드 ───────────────────────────────────────────────────
         try:
-            wav, sr = sf.read(wav_path, dtype='float32')
+            # npy 캐시가 있으면 우선 사용 (wav보다 ~10배 빠름)
+            npy_path = wav_path.replace('.wav', '.npy')
+            if os.path.exists(npy_path):
+                wav = np.load(npy_path)
+                sr  = SR   # 전처리 시 이미 SR로 변환됨
+            else:
+                wav, sr = sf.read(wav_path, dtype='float32')
+
+                # 스테레오 → 모노
+                if wav.ndim == 2:
+                    wav = wav.mean(axis=1)
+
+                # 샘플레이트 변환
+                if sr != SR:
+                    try:
+                        import resampy
+                        wav = resampy.resample(wav, sr, SR)
+                    except ImportError:
+                        pass
         except Exception:
-            wav = np.zeros(MAX_LEN, dtype=np.float32)
-            return torch.FloatTensor(wav).unsqueeze(0), label
+            return torch.zeros(1, MAX_LEN), label
 
-        # 스테레오 → 모노
-        if wav.ndim == 2:
-            wav = wav.mean(axis=1)
-
-        # 샘플레이트 변환 (필요 시)
-        if sr != SR:
-            import resampy
-            wav = resampy.resample(wav, sr, SR)
-
-        # ── 길이 통일 (4초) ────────────────────────────────────────────
+        # 길이 강제 통일 (리샘플링 후에도 반드시 MAX_LEN)
         if len(wav) < MAX_LEN:
             wav = np.pad(wav, (0, MAX_LEN - len(wav)))
-        else:
-            # 랜덤 크롭 (학습 다양성)
+        elif len(wav) > MAX_LEN:
             start = random.randint(0, len(wav) - MAX_LEN)
             wav = wav[start: start + MAX_LEN]
+        wav = wav[:MAX_LEN]  # 혹시 남은 오차 제거
 
-        # ── 노이즈 증강 (진짜 음성에만, 품질 차이 보정) ────────────────
+        # 노이즈 증강: 진짜 음성에만 (TTS와 품질 차이 보정)
+        # 스튜디오 녹음이라도 약간의 노이즈를 추가해 과적합 방지
         if self.noise_aug and label == 0:
-            wav = self._add_noise(wav)
+            wav = self._add_noise(wav, snr_range=(20, 45))
 
         return torch.FloatTensor(wav).unsqueeze(0), label
 
-    def _add_noise(self, wav, snr_range=(15, 40)):
-        """
-        랜덤 SNR로 가우시안 노이즈 추가.
-        snr_range: (min_db, max_db) — 높을수록 노이즈 작음
-        """
+    def _add_noise(self, wav, snr_range=(20, 45)):
         snr_db  = random.uniform(*snr_range)
         sig_pow = np.mean(wav ** 2) + 1e-9
         snr_lin = 10 ** (snr_db / 10)
@@ -164,16 +155,19 @@ class KoreanDeepfakeDataset(Dataset):
         return np.clip(wav + noise, -1.0, 1.0)
 
 
-# ── 클래스 가중치 계산 헬퍼 ──────────────────────────────────────────
 def compute_class_weight(dataset):
-    """
-    CrossEntropyLoss(weight=...) 에 넣을 텐서 반환.
-    샘플 수에 반비례하게 가중치 계산.
-    """
+    """CrossEntropyLoss(weight=...) 에 넣을 텐서 반환"""
     labels = [label for _, label in dataset.items]
     n_real = labels.count(0)
     n_fake = labels.count(1)
     total  = n_real + n_fake
+
+    if n_real == 0 or n_fake == 0:
+        print(f'\n[오류] 진짜={n_real:,}, 가짜={n_fake:,} — 한쪽이 0입니다.')
+        print('  FAKE_DATA_ROOT 경로가 잘못됐을 가능성이 높습니다.')
+        print('  탐색기에서 TS1 폴더가 보이는 경로를 FAKE_DATA_ROOT에 설정하세요.\n')
+        raise ValueError('한쪽 클래스가 0입니다. FAKE_DATA_ROOT 경로를 확인하세요.')
+
     w_real = total / (2 * n_real)
     w_fake = total / (2 * n_fake)
     print(f'  클래스 가중치 → 진짜: {w_real:.3f}, 가짜: {w_fake:.3f}')

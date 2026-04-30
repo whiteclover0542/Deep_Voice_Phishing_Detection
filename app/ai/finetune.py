@@ -29,8 +29,11 @@ from korean_dataset import KoreanDeepfakeDataset, compute_class_weight
 # ── 1. 경로 설정 ───────────────────────────────────────────────────
 PRETRAINED_CKPT = os.path.join(BASE_DIR, 'checkpoints', 'best_model.pth')
 
-REAL_DATA_ROOT = r'D:\User\Desktop\데이터셋\자유대화 음성(일반남녀)\Training'   # ← 109번 경로
-FAKE_DATA_ROOT = r'D:\User\Desktop\데이터셋\Korean\015.감성 및 발화 스타일별 음성합성 데이터\01.데이터'       # ← 466번 경로
+# 109번: Training 폴더 지정 ([원천]3.스튜디오_1, _2 를 자동 탐색)
+REAL_DATA_ROOT = r'D:\User\Desktop\데이터셋\자유대화 음성(일반남녀)\Training_denoised'
+
+# 466번: 원천데이터 폴더 지정 (TS1/1.기쁨/... 를 자동 탐색)
+FAKE_DATA_ROOT = r'D:\User\Desktop\데이터셋\015.감성 및 발화 스타일별 음성합성 데이터\01.데이터\1.Training\원천데이터'
 EN_DATA_ROOT   = r'D:\User\Desktop\데이터셋\ASVspoof\archive'     # 영어 (catastrophic forgetting 방지)
 
 SAVE_DIR  = os.path.join(BASE_DIR, 'checkpoints_ko')
@@ -39,7 +42,7 @@ os.makedirs(SAVE_DIR, exist_ok=True)
 
 # ── 2. 하이퍼파라미터 ──────────────────────────────────────────────
 BATCH_SIZE = 32
-EPOCHS     = 30
+EPOCHS     = 15
 STAGE      = 1       # 1 → 2 → 3 순서로 올리면서 실행
 
 LR_MAP = {1: 1e-4, 2: 1e-5, 3: 1e-6}
@@ -49,10 +52,14 @@ LR = LR_MAP[STAGE]
 MIX_ENGLISH = True
 EN_RATIO    = 0.2    # 영어 비율 (소량 유지로 catastrophic forgetting 방지)
 
-# 진짜 음성 최대 샘플 수
-# 109번(4,000시간) >> 466번(1,067시간) → 불균형 완화 목적
-# None이면 전부 사용하고 클래스 가중치로 보정
-REAL_LIMIT = None
+# ── 데이터 샘플 수 제한 ──────────────────────────────────────────
+# 테스트용: 각각 5000개 정도로 빠르게 확인
+# 본학습:   None (전부 사용)
+MAX_REAL = 5000   # 진짜 음성 최대 샘플 수 (None=전부)
+MAX_FAKE = 5000   # 가짜 음성 최대 샘플 수 (None=전부)
+
+# ── Early Stopping ────────────────────────────────────────────────
+PATIENCE = 5   # 몇 에폭 연속 개선 없으면 멈출지 (Stage 1: 5, Stage 3: 3 권장)
 
 # ── 3. 레이어 동결 ────────────────────────────────────────────────
 #
@@ -118,13 +125,29 @@ def evaluate_eer(model, loader, device, epoch, total_epochs):
     return compute_eer(np.array(all_labels), np.array(all_scores))
 
 # ── 6. 데이터 로더 ────────────────────────────────────────────────
+TARGET_LEN = 64000  # 4초 @ 16kHz — 모든 데이터셋 공통 기준
+
+def collate_fn(batch):
+    """배치 내 wav 길이를 TARGET_LEN으로 강제 통일"""
+    wavs, labels = [], []
+    for wav, label in batch:
+        wav = wav.squeeze(0)  # (1, L) → (L,)
+        if wav.shape[0] < TARGET_LEN:
+            wav = torch.nn.functional.pad(wav, (0, TARGET_LEN - wav.shape[0]))
+        else:
+            wav = wav[:TARGET_LEN]
+        wavs.append(wav.unsqueeze(0))  # (1, L)
+        labels.append(label)
+    return torch.stack(wavs, 0), torch.tensor(labels)
+
 def build_loaders(split='train'):
     ko_dataset = KoreanDeepfakeDataset(
         real_root=REAL_DATA_ROOT,
         fake_root=FAKE_DATA_ROOT,
         split=split,
-        noise_aug=(split == 'train'),   # 학습 때만 노이즈 증강
-        real_limit=REAL_LIMIT,
+        noise_aug=False,
+        real_limit=MAX_REAL,
+        fake_limit=MAX_FAKE,
     )
 
     if MIX_ENGLISH and split == 'train':
@@ -144,6 +167,7 @@ def build_loaders(split='train'):
         num_workers=4,
         pin_memory=True,
         persistent_workers=True,
+        collate_fn=collate_fn,
     )
     return loader, ko_dataset
 
@@ -183,9 +207,10 @@ def main():
     )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
     scaler    = GradScaler('cuda')
-    best_eer  = 100.0
+    best_eer      = 100.0
+    no_improve    = 0      # 개선 없는 에폭 카운터
 
-    print(f'\n[학습 시작]  EPOCHS={EPOCHS}  BATCH={BATCH_SIZE}  LR={LR}\n')
+    print(f'\n[학습 시작]  EPOCHS={EPOCHS}  BATCH={BATCH_SIZE}  LR={LR}  PATIENCE={PATIENCE}\n')
 
     for epoch in range(1, EPOCHS + 1):
         t0 = time.time()
@@ -198,7 +223,8 @@ def main():
               f'| EER {eer:.2f}% | {elapsed/60:.1f}min')
 
         if eer < best_eer:
-            best_eer = eer
+            best_eer   = eer
+            no_improve = 0
             torch.save({
                 'epoch':     epoch,
                 'stage':     STAGE,
@@ -208,6 +234,12 @@ def main():
                 'best_eer':  best_eer,
             }, CKPT_PATH)
             print(f'  → best model saved  (EER {best_eer:.2f}%)')
+        else:
+            no_improve += 1
+            print(f'  개선 없음 ({no_improve}/{PATIENCE})')
+            if no_improve >= PATIENCE:
+                print(f'\n  Early stopping: {PATIENCE}에폭 연속 개선 없음 → 학습 종료')
+                break
 
     print(f'\n파인튜닝 완료. best EER: {best_eer:.2f}%')
     print(f'저장: {CKPT_PATH}')

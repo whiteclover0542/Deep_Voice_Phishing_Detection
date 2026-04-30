@@ -13,6 +13,11 @@ data/
 *.pth
 *.pt
 *.ckpt
+*.npy
+
+# 체크포인트 폴더
+checkpoints/
+checkpoints_ko/
 
 # Flutter
 build/
