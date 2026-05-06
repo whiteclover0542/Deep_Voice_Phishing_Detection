@@ -15,6 +15,12 @@ data/
 *.ckpt
 *.npy
 
+# 오디오 파일
+*.m4a
+*.wav
+*.mp3
+*.flac
+
 # 체크포인트 폴더
 checkpoints/
 checkpoints_ko/
