@@ -13,6 +13,9 @@
 # =====================================================================
 
 import os
+os.environ["OMP_NUM_THREADS"] = "1"   # MKL/OpenMP 스레드 충돌 방지 (multiprocessing 필수)
+os.environ["MKL_NUM_THREADS"] = "1"
+
 import numpy as np
 import soundfile as sf
 import noisereduce as nr
@@ -24,11 +27,11 @@ INPUT_DIR  = r'D:\User\Desktop\데이터셋\자유대화 음성(일반남녀)\Tr
 OUTPUT_DIR = r'D:\User\Desktop\데이터셋\자유대화 음성(일반남녀)\Training_denoised'  # 저장할 곳
 
 # 사용할 스튜디오 폴더 (korean_dataset.py 의 USE_STUDIOS 와 동일하게)
-USE_STUDIOS = ['[원천]3.스튜디오_2']  # 스튜디오_1 압축 풀리면 추가
+USE_STUDIOS = ['[원천]3.스튜디오_1']  # 스튜디오_1 압축 풀리면 추가
 
 # ── 설정 ──────────────────────────────────────────────────────────
 SR          = 16000    # 목표 샘플레이트
-NUM_WORKERS = 2        # 병렬 처리 수 (CPU 코어 수에 맞게 조절)
+NUM_WORKERS = 8        # 병렬 처리 수 (CPU 코어 수에 맞게 조절)
 SKIP_EXIST  = True     # True: 이미 처리된 파일 건너뜀 (이어서 실행 가능)
 
 
@@ -79,7 +82,7 @@ def main():
                 rel = os.path.relpath(src, INPUT_DIR)
                 dst = os.path.join(OUTPUT_DIR, rel)
 
-                if SKIP_EXIST and os.path.exists(dst):
+                if SKIP_EXIST and os.path.exists(dst.replace('.wav', '.npy')):
                     continue
                 file_pairs.append((src, dst))
 
@@ -95,17 +98,24 @@ def main():
     success, fail = 0, 0
     errors = []
 
+    CHUNK = NUM_WORKERS * 32   # 한 번에 큐에 올릴 최대 태스크 수 (메모리 제한)
+
     with ProcessPoolExecutor(max_workers=NUM_WORKERS) as executor:
-        futures = {executor.submit(process_one, pair): pair for pair in file_pairs}
-        pbar = tqdm(as_completed(futures), total=total, unit='file', ncols=80)
-        for future in pbar:
-            path, err = future.result()
-            if err is None:
-                success += 1
-            else:
-                fail += 1
-                errors.append((path, err))
-            pbar.set_postfix(ok=success, fail=fail)
+        pbar = tqdm(total=total, unit='file', ncols=80)
+        # file_pairs 를 CHUNK 단위로 나눠 submit → 메모리 과부하 방지
+        for i in range(0, total, CHUNK):
+            batch = file_pairs[i:i + CHUNK]
+            futures = {executor.submit(process_one, pair): pair for pair in batch}
+            for future in as_completed(futures):
+                path, err = future.result()
+                if err is None:
+                    success += 1
+                else:
+                    fail += 1
+                    errors.append((path, err))
+                pbar.update(1)
+                pbar.set_postfix(ok=success, fail=fail)
+        pbar.close()
 
     print(f'\n완료: {success:,}개 성공 / {fail:,}개 실패')
 

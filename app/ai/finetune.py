@@ -29,37 +29,46 @@ from korean_dataset import KoreanDeepfakeDataset, compute_class_weight
 # ── 1. 경로 설정 ───────────────────────────────────────────────────
 PRETRAINED_CKPT = os.path.join(BASE_DIR, 'checkpoints', 'best_model.pth')
 
-# 109번: Training 폴더 지정 ([원천]3.스튜디오_1, _2 를 자동 탐색)
-REAL_DATA_ROOT = r'D:\User\Desktop\데이터셋\자유대화 음성(일반남녀)\Training_denoised'
+# Training 데이터 루트
+REAL_TRAIN_ROOT = r'D:\User\Desktop\데이터셋\자유대화 음성(일반남녀)\Training_denoised'
+FAKE_TRAIN_ROOT = r'D:\User\Desktop\데이터셋\015.감성 및 발화 스타일별 음성합성 데이터\01.데이터\1.Training\원천데이터'
 
-# 466번: 원천데이터 폴더 지정 (TS1/1.기쁨/... 를 자동 탐색)
-FAKE_DATA_ROOT = r'D:\User\Desktop\데이터셋\015.감성 및 발화 스타일별 음성합성 데이터\01.데이터\1.Training\원천데이터'
-EN_DATA_ROOT   = r'D:\User\Desktop\데이터셋\ASVspoof\archive'     # 영어 (catastrophic forgetting 방지)
+# Validation 데이터 루트 (공식 분할 — 없으면 r'' 로 두면 80/20 fallback)
+REAL_VALID_ROOT = r'D:\User\Desktop\데이터셋\자유대화 음성(일반남녀)\Validation'
+FAKE_VALID_ROOT = r'D:\User\Desktop\데이터셋\015.감성 및 발화 스타일별 음성합성 데이터\01.데이터\2.Validation\원천데이터'
+
+# 전화망 진짜 음성 (없으면 r'')
+PHONE_REAL_ROOT = r'D:\User\Desktop\데이터셋\007.저음질 전화망 음성인식 데이터\01.데이터\1.Training\원천데이터_230316\TS_D01'
+
+EN_DATA_ROOT    = r'D:\User\Desktop\데이터셋\ASVspoof\archive'
 
 SAVE_DIR  = os.path.join(BASE_DIR, 'checkpoints_ko')
 CKPT_PATH = os.path.join(SAVE_DIR, 'best_model_ko.pth')
 os.makedirs(SAVE_DIR, exist_ok=True)
 
+RESUME = False  # True: 이전 학습 이어서 / False: 처음부터
+
 # ── 2. 하이퍼파라미터 ──────────────────────────────────────────────
-BATCH_SIZE = 32
-EPOCHS     = 15
-STAGE      = 1       # 1 → 2 → 3 순서로 올리면서 실행
+BATCH_SIZE      = 32   # 학습용
+EVAL_BATCH_SIZE = 128  # 평가용 (그래디언트 없으므로 크게 설정 → eval 속도 ~4x)
+EPOCHS          = 10
+STAGE           = 1    # 1 → 2 → 3 순서로 올리면서 실행
 
 LR_MAP = {1: 1e-4, 2: 1e-5, 3: 1e-6}
 LR = LR_MAP[STAGE]
 
+RAWBOOST_ALGO = 5    # 1=LnL, 2=ISD, 3=SSI, 4=LnL+ISD, 5=LnL+SSI(추천), 6=ISD+SSI, 7=전부
+
 # 영어 데이터 혼합 (True: 영어+한국어 / False: 한국어만)
 MIX_ENGLISH = True
-EN_RATIO    = 0.2    # 영어 비율 (소량 유지로 catastrophic forgetting 방지)
+EN_RATIO    = 0.2
 
 # ── 데이터 샘플 수 제한 ──────────────────────────────────────────
-# 테스트용: 각각 5000개 정도로 빠르게 확인
-# 본학습:   None (전부 사용)
-MAX_REAL = 5000   # 진짜 음성 최대 샘플 수 (None=전부)
-MAX_FAKE = 5000   # 가짜 음성 최대 샘플 수 (None=전부)
+MAX_REAL = 8000
+MAX_FAKE = 24000
 
 # ── Early Stopping ────────────────────────────────────────────────
-PATIENCE = 5   # 몇 에폭 연속 개선 없으면 멈출지 (Stage 1: 5, Stage 3: 3 권장)
+PATIENCE = 5
 
 # ── 3. 레이어 동결 ────────────────────────────────────────────────
 #
@@ -68,8 +77,8 @@ PATIENCE = 5   # 몇 에폭 연속 개선 없으면 멈출지 (Stage 1: 5, Stage
 # Stage 3: 전체 해제          (전체 미세조정, lr 매우 낮게)
 #
 FREEZE_MAP = {
-    1: ['sinc_conv', 'layer1', 'layer2', 'layer3', 'layer4', 'layer5', 'layer6', 'bn_before_gru'],
-    2: ['sinc_conv', 'layer1', 'layer2', 'layer3'],
+    1: ['sinc', 'bn0', 'blocks', 'bn_out'],           # GRU + FC만 학습
+    2: ['sinc', 'bn0', 'blocks.0', 'blocks.1', 'blocks.2'],  # blocks.3~5 + bn_out + GRU + FC 학습
     3: [],
 }
 
@@ -101,6 +110,8 @@ def train_one_epoch(model, loader, optimizer, criterion, device, epoch, total_ep
             logits = model(wav)
             loss   = criterion(logits, label)
         scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         scaler.step(optimizer)
         scaler.update()
         total_loss += loss.item() * len(label)
@@ -125,27 +136,32 @@ def evaluate_eer(model, loader, device, epoch, total_epochs):
     return compute_eer(np.array(all_labels), np.array(all_scores))
 
 # ── 6. 데이터 로더 ────────────────────────────────────────────────
-TARGET_LEN = 64000  # 4초 @ 16kHz — 모든 데이터셋 공통 기준
+TARGET_LEN = 64000
 
 def collate_fn(batch):
-    """배치 내 wav 길이를 TARGET_LEN으로 강제 통일"""
     wavs, labels = [], []
     for wav, label in batch:
-        wav = wav.squeeze(0)  # (1, L) → (L,)
+        wav = wav.squeeze(0)
         if wav.shape[0] < TARGET_LEN:
             wav = torch.nn.functional.pad(wav, (0, TARGET_LEN - wav.shape[0]))
         else:
             wav = wav[:TARGET_LEN]
-        wavs.append(wav.unsqueeze(0))  # (1, L)
+        wavs.append(wav.unsqueeze(0))
         labels.append(label)
     return torch.stack(wavs, 0), torch.tensor(labels)
 
 def build_loaders(split='train'):
+    is_train = (split == 'train')
     ko_dataset = KoreanDeepfakeDataset(
-        real_root=REAL_DATA_ROOT,
-        fake_root=FAKE_DATA_ROOT,
+        real_root=REAL_TRAIN_ROOT,
+        fake_root=FAKE_TRAIN_ROOT,
         split=split,
-        noise_aug=False,
+        real_val_root=REAL_VALID_ROOT or None,
+        fake_val_root=FAKE_VALID_ROOT or None,
+        phone_real_root=PHONE_REAL_ROOT or None,
+        noise_aug=is_train,
+        rawboost_algo=RAWBOOST_ALGO,
+        tel_aug_fake=is_train,
         real_limit=MAX_REAL,
         fake_limit=MAX_FAKE,
     )
@@ -160,13 +176,15 @@ def build_loaders(split='train'):
     else:
         combined = ko_dataset
 
+    bs = BATCH_SIZE if is_train else EVAL_BATCH_SIZE
     loader = DataLoader(
         combined,
-        batch_size=BATCH_SIZE,
-        shuffle=(split == 'train'),
-        num_workers=4,
+        batch_size=bs,
+        shuffle=is_train,
+        num_workers=8,
         pin_memory=True,
         persistent_workers=True,
+        prefetch_factor=4,
         collate_fn=collate_fn,
     )
     return loader, ko_dataset
@@ -179,7 +197,7 @@ def main():
                else 'cpu')
 
     print('=' * 55)
-    print(f'  Stage {STAGE}  |  LR {LR}  |  device: {device}')
+    print(f'  Stage {STAGE}  |  LR {LR}  |  RawBoost algo {RAWBOOST_ALGO}  |  device: {device}')
     print('=' * 55)
 
     print('\n[데이터 로딩]')
@@ -187,32 +205,74 @@ def main():
     dev_loader,   _             = build_loaders('dev')
 
     model = RawNet2().to(device)
-    if not os.path.exists(PRETRAINED_CKPT):
-        raise FileNotFoundError(f'체크포인트 없음: {PRETRAINED_CKPT}')
 
-    print(f'\n[사전학습 가중치 로드]  {PRETRAINED_CKPT}')
-    ckpt       = torch.load(PRETRAINED_CKPT, map_location=device, weights_only=False)
-    state_dict = ckpt['model'] if isinstance(ckpt, dict) and 'model' in ckpt else ckpt
-    model.load_state_dict(state_dict)
+    best_eer    = 100.0
+    no_improve  = 0
+    start_epoch = 1
 
-    freeze_layers(model, STAGE)
+    if RESUME and os.path.exists(CKPT_PATH):
+        print(f'\n[이어서 학습]  {CKPT_PATH}')
+        ckpt = torch.load(CKPT_PATH, map_location=device, weights_only=False)
+        if isinstance(ckpt, dict) and 'model' in ckpt:
+            model.load_state_dict(ckpt['model'])
+            freeze_layers(model, STAGE)
 
-    print('\n[클래스 가중치 계산]')
-    class_weight = compute_class_weight(train_dataset).to(device)
-    criterion    = nn.CrossEntropyLoss(weight=class_weight)
+            print('\n[클래스 가중치 계산]')
+            class_weight = compute_class_weight(train_dataset).to(device)
+            criterion    = nn.CrossEntropyLoss(weight=class_weight)
 
-    optimizer = torch.optim.Adam(
-        filter(lambda p: p.requires_grad, model.parameters()),
-        lr=LR, weight_decay=1e-4
-    )
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
-    scaler    = GradScaler('cuda')
-    best_eer      = 100.0
-    no_improve    = 0      # 개선 없는 에폭 카운터
+            optimizer = torch.optim.Adam(
+                filter(lambda p: p.requires_grad, model.parameters()),
+                lr=LR, weight_decay=1e-4
+            )
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
+            scaler    = GradScaler('cuda')
 
-    print(f'\n[학습 시작]  EPOCHS={EPOCHS}  BATCH={BATCH_SIZE}  LR={LR}  PATIENCE={PATIENCE}\n')
+            optimizer.load_state_dict(ckpt['optimizer'])
+            scheduler.load_state_dict(ckpt['scheduler'])
+            start_epoch = ckpt['epoch'] + 1
+            best_eer    = ckpt['best_eer']
+            no_improve  = ckpt.get('no_improve', 0)
+            print(f'재시작: Epoch {start_epoch}/{EPOCHS}  |  이전 best EER: {best_eer:.2f}%')
+        else:
+            print('  (에폭 정보 없는 체크포인트 → Epoch 1부터 시작)')
+            model.load_state_dict(ckpt)
+            freeze_layers(model, STAGE)
 
-    for epoch in range(1, EPOCHS + 1):
+            print('\n[클래스 가중치 계산]')
+            class_weight = compute_class_weight(train_dataset).to(device)
+            criterion    = nn.CrossEntropyLoss(weight=class_weight)
+
+            optimizer = torch.optim.Adam(
+                filter(lambda p: p.requires_grad, model.parameters()),
+                lr=LR, weight_decay=1e-4
+            )
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
+            scaler    = GradScaler('cuda')
+    else:
+        if not os.path.exists(PRETRAINED_CKPT):
+            raise FileNotFoundError(f'체크포인트 없음: {PRETRAINED_CKPT}')
+        print(f'\n[사전학습 가중치 로드]  {PRETRAINED_CKPT}')
+        ckpt       = torch.load(PRETRAINED_CKPT, map_location=device, weights_only=False)
+        state_dict = ckpt['model'] if isinstance(ckpt, dict) and 'model' in ckpt else ckpt
+        model.load_state_dict(state_dict)
+        freeze_layers(model, STAGE)
+
+        print('\n[클래스 가중치 계산]')
+        class_weight = compute_class_weight(train_dataset).to(device)
+        criterion    = nn.CrossEntropyLoss(weight=class_weight)
+
+        optimizer = torch.optim.Adam(
+            filter(lambda p: p.requires_grad, model.parameters()),
+            lr=LR, weight_decay=1e-4
+        )
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
+        scaler    = GradScaler('cuda')
+
+    print(f'\n[학습 시작]  EPOCHS={EPOCHS}  BATCH={BATCH_SIZE}  LR={LR}  '
+          f'RawBoost={RAWBOOST_ALGO}  PATIENCE={PATIENCE}\n')
+
+    for epoch in range(start_epoch, EPOCHS + 1):
         t0 = time.time()
         loss, acc = train_one_epoch(model, train_loader, optimizer, criterion,
                                     device, epoch, EPOCHS, scaler)
@@ -226,12 +286,13 @@ def main():
             best_eer   = eer
             no_improve = 0
             torch.save({
-                'epoch':     epoch,
-                'stage':     STAGE,
-                'model':     model.state_dict(),
-                'optimizer': optimizer.state_dict(),
-                'scheduler': scheduler.state_dict(),
-                'best_eer':  best_eer,
+                'epoch':      epoch,
+                'stage':      STAGE,
+                'model':      model.state_dict(),
+                'optimizer':  optimizer.state_dict(),
+                'scheduler':  scheduler.state_dict(),
+                'best_eer':   best_eer,
+                'no_improve': no_improve,
             }, CKPT_PATH)
             print(f'  → best model saved  (EER {best_eer:.2f}%)')
         else:
