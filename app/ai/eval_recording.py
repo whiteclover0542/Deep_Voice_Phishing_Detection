@@ -407,6 +407,21 @@ def _plot_eer(real_scores, fake_scores, eer, out_dir):
         print(f'  시각화 실패: {e}')
 
 
+# ── 간편 실행 함수 ────────────────────────────────────────────────────
+def predict(path, tel=False, ckpt=None):
+    """
+    단일 파일 판별. 코드 안에서 직접 호출:
+        predict(r'D:\경로\파일.wav')
+        predict(r'D:\경로\통화.m4a', tel=True)   # 통화 녹음
+    """
+    device    = 'cuda' if torch.cuda.is_available() else 'cpu'
+    ckpt_path = ckpt or os.path.join(BASE_DIR, 'checkpoints_ko', 'best_model_ko.pth')
+    model     = load_model(ckpt_path, device)
+    score, human_pct, ai_pct, label, confidence = eval_file(model, path, device, tel)
+    print_single_result(path, human_pct, ai_pct, label, confidence)
+    return label, human_pct, ai_pct
+
+
 # ── 메인 ─────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(
@@ -470,4 +485,4 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    predict(r'D:\IT\AiHuman4_SR\project_1\Real_time_Voice_Phishing_Detection\app\ai\진짜_통화_3.m4a', tel=True)

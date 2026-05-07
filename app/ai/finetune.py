@@ -27,7 +27,7 @@ from dataset import ASVspoof2019LA
 from korean_dataset import KoreanDeepfakeDataset, compute_class_weight
 
 # ── 1. 경로 설정 ───────────────────────────────────────────────────
-PRETRAINED_CKPT = os.path.join(BASE_DIR, 'checkpoints', 'best_model.pth')
+PRETRAINED_CKPT = os.path.join(BASE_DIR, 'checkpoints_ko', 'best_model_ko.pth')
 
 # Training 데이터 루트
 REAL_TRAIN_ROOT = r'D:\User\Desktop\데이터셋\자유대화 음성(일반남녀)\Training_denoised'
@@ -51,24 +51,33 @@ RESUME = False  # True: 이전 학습 이어서 / False: 처음부터
 # ── 2. 하이퍼파라미터 ──────────────────────────────────────────────
 BATCH_SIZE      = 32   # 학습용
 EVAL_BATCH_SIZE = 128  # 평가용 (그래디언트 없으므로 크게 설정 → eval 속도 ~4x)
-EPOCHS          = 10
-STAGE           = 1    # 1 → 2 → 3 순서로 올리면서 실행
+EPOCHS          = 15
+STAGE           = 2    # 1 → 2 → 3 순서로 올리면서 실행
 
 LR_MAP = {1: 1e-4, 2: 1e-5, 3: 1e-6}
 LR = LR_MAP[STAGE]
 
-RAWBOOST_ALGO = 5    # 1=LnL, 2=ISD, 3=SSI, 4=LnL+ISD, 5=LnL+SSI(추천), 6=ISD+SSI, 7=전부
+# Stage별 증강 설정: (noise_aug, rawboost_algo, tel_aug_fake)
+# Stage 1: 증강 없음  — GRU+FC가 깨끗한 한국어 패턴 먼저 학습
+# Stage 2: 약한 증강  — SSI(3)만 적용, 전화망 시뮬레이션 추가
+# Stage 3: 풀 증강    — LnL+SSI(5), 전화망 시뮬레이션 모두 적용
+AUG_MAP = {
+    1: (False, 3, False),
+    2: (True,  3, True),
+    3: (True,  5, True),
+}
+_noise_aug, RAWBOOST_ALGO, _tel_aug = AUG_MAP[STAGE]
 
 # 영어 데이터 혼합 (True: 영어+한국어 / False: 한국어만)
-MIX_ENGLISH = True
+MIX_ENGLISH = False
 EN_RATIO    = 0.2
 
 # ── 데이터 샘플 수 제한 ──────────────────────────────────────────
-MAX_REAL = 8000
-MAX_FAKE = 24000
+MAX_REAL = 15000
+MAX_FAKE = 45000
 
 # ── Early Stopping ────────────────────────────────────────────────
-PATIENCE = 5
+PATIENCE = 7
 
 # ── 3. 레이어 동결 ────────────────────────────────────────────────
 #
@@ -159,9 +168,9 @@ def build_loaders(split='train'):
         real_val_root=REAL_VALID_ROOT or None,
         fake_val_root=FAKE_VALID_ROOT or None,
         phone_real_root=PHONE_REAL_ROOT or None,
-        noise_aug=is_train,
+        noise_aug=(is_train and _noise_aug),
         rawboost_algo=RAWBOOST_ALGO,
-        tel_aug_fake=is_train,
+        tel_aug_fake=(is_train and _tel_aug),
         real_limit=MAX_REAL,
         fake_limit=MAX_FAKE,
     )
@@ -182,7 +191,7 @@ def build_loaders(split='train'):
         batch_size=bs,
         shuffle=is_train,
         num_workers=8,
-        pin_memory=True,
+        pin_memory=is_train,
         persistent_workers=True,
         prefetch_factor=4,
         collate_fn=collate_fn,

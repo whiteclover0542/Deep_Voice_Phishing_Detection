@@ -25,6 +25,9 @@ data/
 checkpoints/
 checkpoints_ko/
 
+# 캐시 파일
+app/ai/wav_list_cache/
+
 # Flutter
 build/
 .dart_tool/

@@ -18,11 +18,16 @@
 # =====================================================================
 
 import os
+import json
+import hashlib
 import random
 import numpy as np
 import torch
 from torch.utils.data import Dataset
 import soundfile as sf
+
+_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'wav_list_cache')
+os.makedirs(_CACHE_DIR, exist_ok=True)
 
 SR      = 16000
 MAX_LEN = SR * 4   # 4초
@@ -108,7 +113,16 @@ def apply_rawboost(x, algo=5):
 # ── Dataset ───────────────────────────────────────────────────────────
 
 def _collect_wavs(root, label):
-    """root 하위의 모든 .wav 파일을 (경로, label) 리스트로 반환"""
+    """root 하위의 모든 .wav 파일을 (경로, label) 리스트로 반환 (결과 캐싱)"""
+    cache_key  = hashlib.md5(root.encode('utf-8')).hexdigest()
+    cache_path = os.path.join(_CACHE_DIR, f'{cache_key}_{label}.json')
+
+    if os.path.exists(cache_path):
+        with open(cache_path, 'r', encoding='utf-8') as f:
+            items = [tuple(x) for x in json.load(f)]
+        print(f'    캐시 로드: {len(items):,}개  ({os.path.basename(root)})', flush=True)
+        return items
+
     items = []
     for dirpath, _, files in os.walk(root):
         for fname in files:
@@ -116,6 +130,10 @@ def _collect_wavs(root, label):
                 items.append((os.path.join(dirpath, fname), label))
         if len(items) % 5000 == 0 and len(items) > 0:
             print(f'    스캔 중... {len(items):,}개', flush=True)
+
+    with open(cache_path, 'w', encoding='utf-8') as f:
+        json.dump(items, f, ensure_ascii=False)
+    print(f'    스캔 완료 → 캐시 저장: {len(items):,}개', flush=True)
     return items
 
 
