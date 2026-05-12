@@ -1,6 +1,96 @@
-# STFT 스펙토그램 / MFCC 히트맵 분석
+# RawNet2 신경망 구조 및 STFT / MFCC 분석
 
-## 1. 두 결과 비교
+## 1. RawNet2 신경망 구조 (코드 레벨)
+
+### 전체 데이터 흐름
+
+```
+입력 wav  →  SincConv  →  BN + MaxPool  →  ResBlock × 6  →  GRU × 3  →  Linear  →  진짜/가짜
+(1, 64600)   (128, 64600)  (128, 21533)    (256, ~88)      (1024,)      (2,)
+```
+
+---
+
+### SincConv — 학습 가능한 주파수 필터
+
+```python
+class SincConv(nn.Module):
+    def __init__(self, out_channels=128, kernel_size=1024, sample_rate=16000):
+        # Mel 스케일로 128개 필터의 시작 주파수(f_low)와 대역폭(f_band) 초기화
+        # → 학습하면서 딥페이크 탐지에 유리한 주파수로 조정됨
+        self.f_low  = nn.Parameter(...)   # 128개, 학습 가능
+        self.f_band = nn.Parameter(...)   # 128개, 학습 가능
+
+    def forward(self, x):
+        # bandpass 필터 128개를 raw wav에 직접 적용
+        # → 멜 스펙토그램 없이 모델이 스스로 주파수를 분석
+        filters = torch.cat([flip(right), center, right], dim=1)
+        return F.conv1d(x, filters.unsqueeze(1), padding=...)
+```
+
+**핵심**: `f_low`와 `f_band`가 `nn.Parameter` — 즉 학습으로 바뀌는 값.  
+멜 스펙토그램의 고정 필터와 달리 데이터를 보면서 최적 주파수를 스스로 찾는다.
+
+---
+
+### FMS — 채널별 중요도 자동 조정
+
+```python
+class FMS(nn.Module):
+    def forward(self, x):
+        s = torch.sigmoid(self.scale(x.mean(-1)))  # 채널마다 0~1 가중치 계산
+        return x * s.unsqueeze(-1) + s.unsqueeze(-1)
+```
+
+**핵심**: 128개(또는 256개) 주파수 채널 중 딥페이크 탐지에 중요한 채널에 자동으로 높은 가중치를 줌.
+
+---
+
+### ResBlock × 6 — 패턴 추출
+
+```python
+class ResBlock(nn.Module):
+    def forward(self, x):
+        out = Conv1d → BN → LeakyReLU → Conv1d
+        out = MaxPool1d(3)(out + identity)  # 잔차 연결 + 3배 다운샘플
+        return self.fms(out)                # FMS로 채널 가중치 조정
+```
+
+| 블록 | 입력 채널 | 출력 채널 | 역할 |
+|------|-----------|-----------|------|
+| Block 1 | 128 | 128 | 저수준 파형 패턴 추출 |
+| Block 2 | 128 | 128 | 패턴 정제 |
+| Block 3 | 128 | 256 | 채널 확장, 고수준 특징 |
+| Block 4~6 | 256 | 256 | 복잡한 AI 흔적 포착 |
+
+---
+
+### GRU × 3 — 시간 흐름 분석
+
+```python
+self.gru = nn.GRU(256, 1024, num_layers=3, batch_first=True)
+
+def forward(self, x):
+    x = x.permute(0, 2, 1)   # (batch, time, 256) 형태로 변환
+    x, _ = self.gru(x)        # 시간 순서로 패턴 학습
+    return self.fc(x[:, -1, :])  # 마지막 타임스텝만 분류에 사용
+```
+
+**핵심**: 사람 목소리는 시간 흐름에 따라 자연스럽게 변하지만, AI 음성은 타임스텝 간 변화가 지나치게 규칙적. GRU가 이 차이를 잡아낸다.
+
+---
+
+### 최종 분류기
+
+```python
+self.fc = nn.Linear(1024, 2)  # 출력: [진짜 확률, 가짜 확률]
+```
+
+`softmax` 적용 후 index 1(가짜) 확률이 0.5 초과 → 가짜 판정.
+
+---
+
+## 2. 두 결과 비교
 
 ### 가짜 (AI 목소리) — 가짜 100%
 - **STFT**: 고음역(3kHz 이상)이 전 구간에 걸쳐 균일하게 빽빽하게 채워져 있음. 수직 줄무늬가 일정한 간격으로 반복됨
